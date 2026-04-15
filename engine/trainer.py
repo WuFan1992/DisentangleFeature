@@ -305,6 +305,8 @@ class TrainerMultiView:
                 "cross_reconstruction": 0.0,
                 "orthogonality": 0.0,
                 "noise_regularization": 0.0,
+                "reliability": 0.0,
+                "heatmap": 0.0,
             }
 
             for b in range(batch_size):
@@ -316,6 +318,7 @@ class TrainerMultiView:
 
                 V = len(sample_images)
                 shared_maps, f_inv_maps, f_geo_maps, f_noise_maps = [], [], [], []
+                rel_maps, heatmap_maps = [], []
                 for v in range(V):
                     img = sample_images[v]
                     if img.dim() == 3:
@@ -325,6 +328,8 @@ class TrainerMultiView:
                     f_inv_maps.append(out["f_inv"])
                     f_geo_maps.append(out["f_geo"])
                     f_noise_maps.append(out["f_noise"])
+                    rel_maps.append(out["reliability"])
+                    heatmap_maps.append(out["heatmap"])
 
                 for k in subset_views_list:
                     subset_ids, (corrs_k, vis_k) = batch_points_dict[k]
@@ -348,6 +353,7 @@ class TrainerMultiView:
                     f_inv_per_point = []
                     f_geo_per_point = []
                     f_noise_per_point = []
+                    rel_per_point = []
                     subset_poses = []
 
                     for v in range(k):
@@ -366,6 +372,9 @@ class TrainerMultiView:
                         f_noise_per_point.append(
                             sample_map_at_coords(f_noise_maps[view_idx], coords, H_orig, W_orig)
                         )
+                        rel_per_point.append(
+                            sample_map_at_coords(rel_maps[view_idx], coords, H_orig, W_orig)
+                        )
                         subset_poses.append(
                             torch.as_tensor(sample_data['T'][view_idx], dtype=torch.float32, device=self.device)
                         )
@@ -374,6 +383,7 @@ class TrainerMultiView:
                     f_inv = torch.stack(f_inv_per_point, dim=1)
                     f_geo = torch.stack(f_geo_per_point, dim=1)
                     f_noise = torch.stack(f_noise_per_point, dim=1)
+                    rel = torch.stack(rel_per_point, dim=1)
                     visibility = (
                         torch.ones((N_points, k), device=self.device, dtype=torch.bool)
                         if vis_k is None else vis_k.bool().to(self.device)
@@ -388,6 +398,27 @@ class TrainerMultiView:
                         poses=subset_poses,
                         visibility=visibility,
                     )
+                    loss_rel, _ = reliability_loss_from_confidence(rel, f_inv, visibility)
+                    heatmap_gt = build_heatmap_target(
+                        corrs_k,
+                        visibility,
+                        H=H_orig,
+                        W=W_orig,
+                        downsample=4,
+                        device=self.device
+                    )
+                    loss_heatmap = f_inv.new_tensor(0.0)
+                    for v in range(k):
+                        view_idx = id_to_idx[subset_ids[v]]
+                        loss_heatmap = loss_heatmap + heatmap_loss(
+                            heatmap_maps[view_idx],
+                            heatmap_gt[v:v+1]
+                        )
+                    loss_heatmap = loss_heatmap / k
+
+                    losses["reliability"] = loss_rel
+                    losses["heatmap"] = loss_heatmap
+                    losses["total"] = losses["total"] + 0.1 * loss_rel + 0.5 * loss_heatmap
 
                     loss_total_accum = loss_total_accum + subset_weights[k] * losses["total"]
                     for key in metric_sums:
@@ -410,6 +441,8 @@ class TrainerMultiView:
                 f"[Iter {iter_idx}] "
                 f"loss:{loss.item():.4f} "
                 f"inv:{metric_avgs['inv_nce'].item():.4f} "
+                f"rel:{metric_avgs['reliability'].item():.4f} "
+                f"hm:{metric_avgs['heatmap'].item():.4f} "
                 f"geo:{metric_avgs['geo'].item():.4f} "
                 f"recon:{metric_avgs['reconstruction'].item():.4f}"
             )
@@ -427,6 +460,8 @@ class TrainerMultiView:
             self.writer.add_scalar('Loss/cross_reconstruction', metric_avgs['cross_reconstruction'].item(), iter_idx)
             self.writer.add_scalar('Loss/orthogonality', metric_avgs['orthogonality'].item(), iter_idx)
             self.writer.add_scalar('Loss/noise_regularization', metric_avgs['noise_regularization'].item(), iter_idx)
+            self.writer.add_scalar('Loss/reliability', metric_avgs['reliability'].item(), iter_idx)
+            self.writer.add_scalar('Loss/heatmap', metric_avgs['heatmap'].item(), iter_idx)
 
 
 

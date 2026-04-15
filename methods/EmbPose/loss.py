@@ -183,6 +183,98 @@ def noise_regularization_loss(f_noise):
     return f_noise.pow(2).mean()
 
 
+def heatmap_mse_loss(pred, target):
+    return F.mse_loss(pred, target)
+
+
+def heatmap_topk_loss(pred, target, topk=1024):
+    """
+    pred: [B, 1, H, W]
+    target: [B, 1, H, W]
+    """
+    B = pred.shape[0]
+    loss = pred.new_tensor(0.0)
+
+    for b in range(B):
+        p = pred[b].reshape(-1)
+        t = target[b].reshape(-1)
+
+        if t.sum() < 1e-6:
+            continue
+
+        k = min(topk, t.numel())
+        idx = torch.topk(t, k=k).indices
+        loss = loss + (-torch.log(p[idx] + 1e-6).mean())
+
+    return loss / max(B, 1)
+
+
+def heatmap_nms_loss(pred):
+    """
+    Encourage local maxima.
+    """
+    maxpool = F.max_pool2d(pred, kernel_size=3, stride=1, padding=1)
+    return F.l1_loss(pred, maxpool)
+
+
+def heatmap_loss(pred, target, topk=1024):
+    loss_mse = heatmap_mse_loss(pred, target)
+    loss_topk = heatmap_topk_loss(pred, target, topk=topk)
+    loss_nms = heatmap_nms_loss(pred)
+    return loss_mse + 0.5 * loss_topk + 0.1 * loss_nms
+
+
+def reliability_loss_from_confidence(
+    rel_pred,
+    f_inv,
+    visibility,
+    topk=128,
+    eps=1e-6,
+):
+    """
+    rel_pred: [N, V, 1]
+    f_inv: [N, V, C]
+    visibility: [N, V]
+    """
+    N, V, _ = f_inv.shape
+    f = F.normalize(f_inv, dim=2)
+
+    conf = torch.zeros(N, V, device=f.device)
+    count = 0
+
+    for i in range(V):
+        for j in range(i + 1, V):
+            mask = visibility[:, i] & visibility[:, j]
+            idx = mask.nonzero(as_tuple=False).squeeze(-1)
+            if idx.numel() < 10:
+                continue
+
+            fi = f[idx, i]
+            fj = f[idx, j]
+            sim = fi @ fj.t()
+
+            k_eff = min(topk, sim.size(1))
+            topk_val, topk_idx = torch.topk(sim, k=k_eff, dim=1)
+            p_ij = F.softmax(topk_val, dim=1)
+
+            sim_t = sim.t()
+            topk_val_t = torch.gather(sim_t, 1, topk_idx.t()).t()
+            p_ji = F.softmax(topk_val_t, dim=1)
+
+            conf_ij = (p_ij * p_ji).sum(dim=1)
+            conf[idx, i] += conf_ij
+            conf[idx, j] += conf_ij
+            count += 1
+
+    conf = conf / (count + eps)
+    conf = conf.clamp(eps, 1.0)
+    target = conf.detach()
+
+    rel_pred = rel_pred.squeeze(-1)
+    loss = F.mse_loss(rel_pred, target)
+    return loss, target
+
+
 def total_disentangle_loss(
     kpnet,
     f_inv,

@@ -9,7 +9,6 @@ import numpy as np
 def build_heatmap_target(
     corrs_k,
     visibility,
-    sigma,
     H, W,
     downsample=4,
     device="cuda"
@@ -17,7 +16,6 @@ def build_heatmap_target(
     """
     corrs_k: [N, V, 2] (pixel coords in original image)
     visibility: [N, V]
-    sigma: [N, V, 1]
     """
     
 
@@ -51,11 +49,12 @@ def build_heatmap_target(
         # repeatability（=该 subset 的 view 数）
         repeatability = float(V) / 5.0   # normalize to [0,1]
 
-        # stability（用 sigma）
-        sigma_v = sigma[vis, v]
-        stability = 1.0 - sigma_v
-
-        score = repeatability * stability  # [N_vis]
+        score = torch.full(
+            (coords.shape[0],),
+            repeatability,
+            device=device,
+            dtype=heatmap.dtype
+        )  # [N_vis]
 
         """
         for i in range(xs.shape[0]):
@@ -171,13 +170,15 @@ def generate_exclusive_subsets(batch_data, subset_views_list=[5,4,3,2], scale=4)
     id_to_idx = {vid: i for i, vid in enumerate(all_ids)}
 
     batch_points_dict = {}
-    used_points = set()  # 用于记录已经被使用的匹配点索引
+    used_points = set()  # 用于记录已经被使用的匹配点坐标 (anchor view)
 
     for k in subset_views_list:
         if k == 5:
             # 保留全部 5-view 点
             batch_points_dict[5] = (all_ids, (multi_corrs_5view, vis_5view))
-            used_points.update(range(multi_corrs_5view.shape[0]))
+            # 添加 anchor 坐标到 used_points，舍入到1位小数避免精度问题
+            anchor_coords = multi_corrs_5view[:, 0].cpu().numpy()  # [N, 2]
+            used_points.update(tuple(np.round(coord, 1)) for coord in anchor_coords)
         else:
             # 生成互斥子集
             subset_ids, (multi_corrs_k, vis_k) = select_subset_and_recompute_multi_corrs(
@@ -305,17 +306,19 @@ def select_subset_and_recompute_multi_corrs(data_5view, subset_views=3, scale=4,
 
     # ===== 安全互斥处理 =====
     if len(used_points) > 0 and multi_corrs_subset.shape[0] > 0:
-        keep_mask = torch.ones(multi_corrs_subset.shape[0], dtype=torch.bool, device=multi_corrs_subset.device)
-        # 遍历每行，检查是否已经使用
-        to_keep = []
+        keep_indices = []
         for i in range(multi_corrs_subset.shape[0]):
-            if i not in used_points:
-                to_keep.append(True)
-            else:
-                to_keep.append(False)
-        keep_mask = torch.tensor(to_keep, dtype=torch.bool, device=multi_corrs_subset.device)
-        multi_corrs_subset = multi_corrs_subset[keep_mask]
-        vis_tensor = vis_tensor[keep_mask]
+            anchor_coord = tuple(np.round(multi_corrs_subset[i, 0].cpu().numpy(), 1))
+            if anchor_coord not in used_points:
+                keep_indices.append(i)
+                used_points.add(anchor_coord)  # 添加到 used_points 以防后续子集使用
+        
+        if keep_indices:
+            multi_corrs_subset = multi_corrs_subset[keep_indices]
+            vis_tensor = vis_tensor[keep_indices]
+        else:
+            multi_corrs_subset = torch.empty((0, subset_views, 2), device=multi_corrs_subset.device)
+            vis_tensor = torch.empty((0, subset_views), dtype=torch.bool, device=vis_tensor.device)
 
     return subset_ids, (multi_corrs_subset, vis_tensor)
 """

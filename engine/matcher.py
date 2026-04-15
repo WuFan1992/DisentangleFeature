@@ -3,222 +3,199 @@ import torch.nn.functional as F
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
-from methods.EmbPose.varkpnetmodel import *
+from methods.EmbPose.varkpnetmodel import VUDNet
 
 
-# -----------------------------
-# 1. 网络定义（和训练时一致）
-# -----------------------------
-# 注意：这里使用你训练好的网络类 VUDNet
-# 假设你已经有 VUDNet 类和所有子模块的代码
 def pad_to_same_height(img1, img2):
     h1, w1, _ = img1.shape
     h2, w2, _ = img2.shape
-    
     max_h = max(h1, h2)
-    
+
     def pad(img, target_h):
         h, w, c = img.shape
         pad_h = target_h - h
-        return np.pad(img, ((0,pad_h),(0,0),(0,0)), mode='constant')
-    
+        return np.pad(img, ((0, pad_h), (0, 0), (0, 0)), mode='constant')
+
     return pad(img1, max_h), pad(img2, max_h)
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 初始化网络
-net= VUDNet(feature_dim=64, dim_geo=32,
-                 dim_app=16)
-net = net.to(device)
-
-# 加载训练好的权重
-checkpoint_path = "checkpoints/kpnet_pcorrect_01.pth"
-checkpoint = torch.load(checkpoint_path, map_location=device)
-net.load_state_dict(checkpoint)  # 假设你保存的是 model_state_dict
-net.eval()
-
-# -----------------------------
-# 2. 图像读入 + 推理
-# -----------------------------
 def load_image(path, device):
     img = cv2.imread(path)
+    if img is None:
+        raise FileNotFoundError(f"Image not found: {path}")
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_tensor = torch.from_numpy(img).float() / 255.0
-    img_tensor = img_tensor.permute(2,0,1).unsqueeze(0).to(device)
+    img_tensor = img_tensor.permute(2, 0, 1).unsqueeze(0).to(device)
     return img_tensor, img
 
-img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/511190120_77bee89b37_o.jpg"
 
-#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
-#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/307037213_48891bca3e_o.jpg"
+def extract_keypoints(heatmap, reliability, num_keypoints=200, border=16, min_score=1e-4):
+    score = heatmap * reliability
+    score = score.squeeze(0).squeeze(0)
 
-#img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000413.color.png"
-#img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/frame-000240.color.png"
+    max_pool = F.max_pool2d(score.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1)
+    peak_mask = score == max_pool.squeeze(0).squeeze(0)
+    score = score * peak_mask.float()
 
-#img_path1 = "datasets/MegaDepth_v1/0022/dense0/testimgs/republique1.jpg"
-#img_path2 = "datasets/MegaDepth_v1/0022/dense0/testimgs/republique2.jpg"
+    if border > 0:
+        score[:border, :] = 0
+        score[-border:, :] = 0
+        score[:, :border] = 0
+        score[:, -border:] = 0
 
-img_tensor1, img1 = load_image(img_path1, device)
-img_tensor2, img2 = load_image(img_path2, device)
+    flat = score.view(-1)
+    topk = min(num_keypoints, flat.numel())
+    values, idx = torch.topk(flat, k=topk)
+    keep = values > min_score
+    values = values[keep]
+    idx = idx[keep]
+
+    if idx.numel() == 0:
+        return np.zeros((0, 2), dtype=np.float32), np.zeros((0,), dtype=np.float32), score
+
+    ys = (idx // score.size(1)).cpu().numpy()
+    xs = (idx % score.size(1)).cpu().numpy()
+    coords_feat = np.stack([xs, ys], axis=-1).astype(np.float32)
+    scores = values.cpu().numpy().astype(np.float32)
+    return coords_feat, scores, score
 
 
-with torch.no_grad():
-    out1 = net(img_tensor1)
-    out2 = net(img_tensor2)
+def map_feat_coords_to_image(coords_feat, img_shape, feat_shape):
+    H, W = img_shape[:2]
+    Hf, Wf = feat_shape
+    scale_x = W / Wf
+    scale_y = H / Hf
+    coords_img = coords_feat.copy()
+    coords_img[:, 0] *= scale_x
+    coords_img[:, 1] *= scale_y
+    return coords_img
 
-# -----------------------------
-# 3. 提取关键点（heatmap*reliability*(1-sigma)）
-# -----------------------------
-def extract_keypoints(heatmap, reliability, sigma, img_shape, num_keypoints=200):
-    hmap = heatmap.squeeze().cpu().numpy()
-    rel = reliability.squeeze().cpu().numpy()
-    sig = sigma.squeeze().cpu().numpy()
-    
-    # ===== 📊 统计信息 =====
-    print("\n" + "="*60)
-    print("📊 关键点提取的参数统计")
-    print("="*60)
-    print(f"Heatmap  - min: {hmap.min():.4f}, max: {hmap.max():.4f}, mean: {hmap.mean():.4f}")
-    print(f"Reliability - min: {rel.min():.4f}, max: {rel.max():.4f}, mean: {rel.mean():.4f}")
-    print(f"Sigma    - min: {sig.min():.4f}, max: {sig.max():.4f}, mean: {sig.mean():.4f}")
-    
-    score = hmap * rel * (1 - sig)
-    print(f"Score (hmap*rel*(1-sig)) - min: {score.min():.4f}, max: {score.max():.4f}, mean: {score.mean():.4f}")
-    
-    score_without_rel = hmap * (1 - sig)
-    print(f"Score (hmap*(1-sig))     - min: {score_without_rel.min():.4f}, max: {score_without_rel.max():.4f}, mean: {score_without_rel.mean():.4f}")
-    print("="*60 + "\n")
 
-    # ✅ ====== 新增：mask 掉边界 ======
-    margin = 16   # 👉 可以调：8 / 16 / 32
-    score[:margin, :] = 0
-    score[-margin:, :] = 0
-    score[:, :margin] = 0
-    score[:, -margin:] = 0
+def coords_to_feat(feat_map, coords_feat):
+    B, C, H, W = feat_map.shape
+    if coords_feat.shape[0] == 0:
+        return np.zeros((0, C), dtype=np.float32)
+    x = np.clip(np.round(coords_feat[:, 0]).astype(int), 0, W - 1)
+    y = np.clip(np.round(coords_feat[:, 1]).astype(int), 0, H - 1)
+    feat = feat_map[0, :, y, x].permute(1, 0)
+    feat = F.normalize(feat, dim=1)
+    return feat.cpu().numpy()
 
-    # 提取候选点
-    coords = np.argwhere(score > 0.0)[:, [1, 0]]  # (x,y)
-    scores = score[score > 0.0]
 
-    # 排序
-    idx = np.argsort(scores)[::-1]
-    coords = coords[idx]
-    scores = scores[idx]
+def visualize_matches(img1, img2, coords1, coords2, matches):
+    img1_pad, img2_pad = pad_to_same_height(img1, img2)
+    concat_img = np.concatenate([img1_pad, img2_pad], axis=1)
 
-    # score阈值过滤
-    mask = scores > 0.001
-    coords = coords[mask]
-    scores = scores[mask]
-    print(f"{len(coords)}")
-
-    # top-K
-    coords = coords[:num_keypoints]
-    scores = scores[:num_keypoints]
-
-    # 映射回原图
-    Hf, Wf = hmap.shape
-    Hi, Wi = img_shape[:2]
-    
-    scale_x = Wi / Wf
-    scale_y = Hi / Hf
-    
-    coords = coords.astype(np.float32)
-    coords[:, 0] *= scale_x
-    coords[:, 1] *= scale_y
-    
-    return coords, scores
-
-coords1, scores1 = extract_keypoints(
-    out1['heatmap'], out1['reliability'], out1['sigma'], img1.shape
-)
-coords2, scores2 = extract_keypoints(
-    out2['heatmap'], out2['reliability'], out2['sigma'], img2.shape
-)
-
-# -----------------------------
-# 4. 匹配关键点 (余弦相似度 + MNN + 距离过滤)
-# -----------------------------
-def coords_to_feat(feat_map, coords, img_shape):
-    # feat_map: [1,C,H,W], coords: [N,2] 原图坐标
-    B,C,H,W = feat_map.shape
-    x = np.clip((coords[:,0] * W / img_shape[1]).astype(int), 0, W-1)
-    y = np.clip((coords[:,1] * H / img_shape[0]).astype(int), 0, H-1)
-    idx = y * W + x
-    feat = feat_map.squeeze(0).permute(1,2,0).reshape(-1,C)[idx]
-    return F.normalize(feat, dim=1).cpu().numpy()
-
-f1 = coords_to_feat(out1['f_inv'], coords1, img1.shape)
-f2 = coords_to_feat(out2['f_inv'], coords2, img2.shape)
-
-# -----------------------------
-# 4. 匹配关键点 (余弦相似度 + MNN + 距离过滤)
-# -----------------------------
-sim = f1 @ f2.T
-
-# 正向最近邻
-idx12 = np.argmax(sim, axis=1)
-# 反向最近邻
-idx21 = np.argmax(sim, axis=0)
-
-# mutual nearest neighbor
-matches = []
-for i, j in enumerate(idx12):
-    if idx21[j] == i:
-        """
-        # 添加距离过滤：计算像素距离
-        pt1 = coords1[i]
-        pt2 = coords2[j]
-        dist = np.linalg.norm(pt1 - pt2)
-        if dist < 100:  # 像素距离阈值，可调
-        """
-        matches.append([i, j])
-
-matches = np.array(matches)
-
-print(f"Total MNN matches: {len(matches)} (after distance filter)")
-
-# -----------------------------
-# 5. 可视化
-# -----------------------------
-def visualize(img1, img2, coords1, coords2, matches, heatmap1, heatmap2, sigma1, sigma2):
-    
-    # ✅ ====== 新增：padding ======
-    img1, img2 = pad_to_same_height(img1, img2)
-
-    concat_img = np.concatenate([img1, img2], axis=1)
-    
-    plt.figure(figsize=(15,7))
+    plt.figure(figsize=(16, 8))
     plt.imshow(concat_img)
-    
-    for m in matches:
-        pt1 = coords1[m[0]]
-        pt2 = coords2[m[1]] + np.array([img1.shape[1],0])
-        
-        plt.plot([pt1[0],pt2[0]],[pt1[1],pt2[1]],'y',linewidth=1)
-    
-    plt.title("Keypoint Matches")
+    for i, j in matches:
+        pt1 = coords1[i]
+        pt2 = coords2[j] + np.array([img1_pad.shape[1], 0])
+        plt.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]], 'y', linewidth=1)
     plt.axis('off')
-    plt.show()
-    
-    # Heatmap + Variance（不变）
-    fig, axes = plt.subplots(2,2,figsize=(12,10))
-    axes[0,0].imshow(heatmap1.squeeze().cpu(), cmap='hot')
-    axes[0,0].set_title("Heatmap img1")
-    axes[0,0].axis('off')
-    
-    axes[0,1].imshow(heatmap2.squeeze().cpu(), cmap='hot')
-    axes[0,1].set_title("Heatmap img2")
-    axes[0,1].axis('off')
-    
-    axes[1,0].imshow(sigma1.squeeze().cpu(), cmap='viridis')
-    axes[1,0].set_title("Variance img1")
-    axes[1,0].axis('off')
-    
-    axes[1,1].imshow(sigma2.squeeze().cpu(), cmap='viridis')
-    axes[1,1].set_title("Variance img2")
-    axes[1,1].axis('off')
-    
+    plt.title(f"Matches: {len(matches)}")
     plt.show()
 
-visualize(img1, img2, coords1, coords2, matches, out1['heatmap'], out2['heatmap'], out1['sigma'], out2['sigma'])
+
+def visualize_single_maps(img, heatmap, reliability, inv_map, geo_map, app_map, title_prefix=""):
+    img_np = img if isinstance(img, np.ndarray) else img.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    heatmap = heatmap.squeeze().cpu().numpy()
+    reliability = reliability.squeeze().cpu().numpy()
+    inv_map = inv_map.squeeze().cpu().numpy()
+    geo_map = geo_map.squeeze().cpu().numpy()
+    app_map = app_map.squeeze().cpu().numpy()
+
+    if inv_map.ndim == 3:
+        inv_vis = inv_map.mean(axis=0)
+    else:
+        inv_vis = inv_map
+    if geo_map.ndim == 3:
+        geo_vis = geo_map.mean(axis=0)
+    else:
+        geo_vis = geo_map
+    if app_map.ndim == 3:
+        app_vis = app_map.mean(axis=0)
+    else:
+        app_vis = app_map
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    axes[0, 0].imshow(img_np)
+    axes[0, 0].set_title(f"{title_prefix} Image")
+    axes[0, 0].axis('off')
+    axes[0, 1].imshow(heatmap, cmap='hot')
+    axes[0, 1].set_title(f"{title_prefix} Heatmap")
+    axes[0, 1].axis('off')
+    axes[0, 2].imshow(reliability, cmap='viridis')
+    axes[0, 2].set_title(f"{title_prefix} Reliability")
+    axes[0, 2].axis('off')
+    axes[1, 0].imshow(inv_vis, cmap='plasma')
+    axes[1, 0].set_title(f"{title_prefix} Inv Map")
+    axes[1, 0].axis('off')
+    axes[1, 1].imshow(geo_vis, cmap='magma')
+    axes[1, 1].set_title(f"{title_prefix} Geo Map")
+    axes[1, 1].axis('off')
+    axes[1, 2].imshow(app_vis, cmap='cividis')
+    axes[1, 2].set_title(f"{title_prefix} App Map")
+    axes[1, 2].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+
+def visualize_all_maps(img, out, title_prefix=""):
+    inv_map = out.get('f_inv', out.get('f_noise', out.get('f_app', None)))
+    geo_map = out.get('f_geo', inv_map)
+    app_map = out.get('f_app', out.get('f_noise', inv_map))
+    visualize_single_maps(img, out['heatmap'], out['reliability'], inv_map, geo_map, app_map, title_prefix)
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    net = VUDNet(feature_dim=128, dim_geo=32, dim_noise=16, pose_dim=9, pose_embed=128)
+    net = net.to(device)
+
+    checkpoint_path = "checkpoints/kpnet_iter_44999.pth"
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    if isinstance(checkpoint, dict) and 'state_dict' in checkpoint:
+        checkpoint = checkpoint['state_dict']
+    net.load_state_dict(checkpoint, strict=False)
+    net.eval()
+
+    #img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+    #img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/511190120_77bee89b37_o.jpg"
+    
+    img_path1 = "datasets/MegaDepth_v1/0022/dense0/imgs/186069410_b743faece0_o.jpg"
+    img_path2 = "datasets/MegaDepth_v1/0022/dense0/imgs/307037213_48891bca3e_o.jpg"
+
+    img_tensor1, img1 = load_image(img_path1, device)
+    img_tensor2, img2 = load_image(img_path2, device)
+
+    with torch.no_grad():
+        out1 = net(img_tensor1)
+        out2 = net(img_tensor2)
+
+    coords_feat1, scores1, _ = extract_keypoints(out1['heatmap'], out1['reliability'], num_keypoints=50, border=16)
+    coords_feat2, scores2, _ = extract_keypoints(out2['heatmap'], out2['reliability'], num_keypoints=50, border=16)
+
+    coords1 = map_feat_coords_to_image(coords_feat1, img1.shape, out1['heatmap'].shape[-2:])
+    coords2 = map_feat_coords_to_image(coords_feat2, img2.shape, out2['heatmap'].shape[-2:])
+
+    print(f"Image1 keypoints: {len(coords1)}, Image2 keypoints: {len(coords2)}")
+
+    f1 = coords_to_feat(out1['f_inv'], coords_feat1)
+    f2 = coords_to_feat(out2['f_inv'], coords_feat2)
+
+    sim = f1 @ f2.T
+    idx12 = np.argmax(sim, axis=1)
+    idx21 = np.argmax(sim, axis=0)
+    matches = [(i, j) for i, j in enumerate(idx12) if idx21[j] == i]
+    print(f"Total MNN matches: {len(matches)}")
+
+    visualize_matches(img1, img2, coords1, coords2, matches)
+    visualize_all_maps(img1, out1, title_prefix="Image1")
+    visualize_all_maps(img2, out2, title_prefix="Image2")
+
+
+
+if __name__ == '__main__':
+    main()

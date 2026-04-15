@@ -179,16 +179,35 @@ class VUDNet(nn.Module):
             out_dim=feature_dim
         )
 
+        self.reliability_head = nn.Sequential(
+            nn.Conv2d(feature_dim, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, 1),
+            nn.Sigmoid()
+        )
+        self.heatmap_head = nn.Sequential(
+            nn.Conv2d(feature_dim, 64, 3, padding=1),
+            nn.GroupNorm(8, 64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 1, 1),
+            nn.Sigmoid()
+        )
+
     def forward(self, img):
         shared = self.backbone(img)
         f_inv, f_geo, f_noise = self.encoder(shared)
+        reliability = self.reliability_head(shared)
+        heatmap = self.heatmap_head(shared)
 
         return {
             "shared": shared,
             "f_inv": f_inv,
             "f_geo": f_geo,
             "f_noise": f_noise,
-            "f_app": f_noise
+            "f_app": f_noise,
+            "reliability": reliability,
+            "heatmap": heatmap,
         }
 
     def transform_geo(self, f_geo, T_i, T_j):
@@ -234,42 +253,3 @@ def regularization_loss(stable, view, noise, weight=1e-4):
     return weight * (stable.pow(2).mean() + view.pow(2).mean() + noise.pow(2).mean())
 
 
-def train_vudnet_model(model, data_loader, num_epochs, learning_rate, device=None):
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model.to(device)
-    model.train()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-
-    for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        for batch in data_loader:
-            if isinstance(batch, dict):
-                imgs = batch.get("image", batch.get("img", batch.get("imgs")))
-                poses = batch.get("pose", batch.get("poses", None))
-            else:
-                imgs, poses = batch if len(batch) >= 2 else (batch[0], None)
-
-            imgs = imgs.to(device)
-            poses = poses.to(device) if poses is not None else None
-
-            optimizer.zero_grad()
-            output = model(imgs)
-            stable = output["f_inv"]
-            view = output["f_geo"]
-            noise = output["f_app"]
-
-            loss = mutual_information_loss(stable, view, noise)
-            loss = loss + regularization_loss(stable, view, noise)
-            if poses is not None:
-                loss = loss + reconstruction_loss(view, poses)
-
-            loss.backward()
-            optimizer.step()
-            epoch_loss += loss.item()
-
-        avg_loss = epoch_loss / len(data_loader)
-        print(f"Epoch [{epoch+1}/{num_epochs}] avg loss: {avg_loss:.4f}")
-
-    return model
